@@ -1,1 +1,0 @@
-import{G as e}from"./i18n-BGkpUcXf.js";var t=e(`outline`,`x`,`X`,[[`path`,{d:`M18 6l-12 12`,key:`svg-0`}],[`path`,{d:`M6 6l12 12`,key:`svg-1`}]]);export{t};
