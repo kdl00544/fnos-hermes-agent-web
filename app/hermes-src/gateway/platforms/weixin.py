@@ -518,6 +518,43 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return True if text in {"1", "true", "yes", "on"} else False if text in {"0", "false", "no", "off"} else default
 
 
+def _silk_duration_ms(path: str, frame_ms: int = 20) -> int:
+    """Duration of a SILK clip in ms, for the voice item's ``playtime`` (WeChat renders the bubble
+    from the item field, not from the payload). Tencent framing keeps a leading 0x02 before the header."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return 0
+    pos = 10 if data[:1] == b"\x02" else 9
+    frames = 0
+    while pos + 2 <= len(data):
+        size = data[pos] | (data[pos + 1] << 8)
+        pos += 2 + size
+        frames += 1
+    return frames * frame_ms
+
+
+def _to_weixin_silk(src: str) -> str:
+    """Transcode any audio file to WeChat SILK (24 kHz mono, Tencent framing) via ffmpeg + pilk.
+    Raises when either is unavailable — callers fall back to sending the original as a file."""
+    import pilk, subprocess, tempfile
+    pcm, silk = tempfile.mktemp(suffix=".pcm"), tempfile.mktemp(suffix=".silk")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-f", "s16le", "-ac", "1", "-ar", "24000", pcm],
+            check=True, capture_output=True,
+        )
+        # silk_rate must be explicit: pilk's default None reaches the C layer as a bad int.
+        pilk.SilkEncoder(pcm_rate=24000, silk_rate=24000).encode(pcm, silk, tencent=True)
+        if not os.path.getsize(silk):
+            raise RuntimeError("pilk produced an empty silk file")
+        return silk
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(pcm)
+
+
 def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     for item in item_list:
         if item.get("type") == ITEM_TEXT:
@@ -534,18 +571,15 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
             return text
     for item in item_list:
         if item.get("type") == ITEM_VOICE:
-            # Tencent's ``voice_item.text`` is their STT output and is wrong for non-Chinese audio.
-            # When raw audio exists return "" so gateway/run.py's central STT transcribes the download;
-            # otherwise use Weixin's transcript but mark its voice origin.
-            # #27300: Tencent Cloud's `voice_item.text` is their STT output, which is wrong for any
-            # non-Chinese audio (the original report was a Russian voice message that came back as English
-            # gibberish). Return empty so the central STT pipeline in ``gateway/run.py`` produces the body
-            # from the downloaded audio instead.
+            # Weixin's own STT (``voice_item.text``). Preferred over local whisper ON THIS BOX: measured
+            # exact on Chinese clips where faster-whisper small/medium scored 0-1 of 3. ``_collect_media``
+            # skips downloading such a clip so the central STT cannot prepend a worse second transcript.
+            # Upstream #27300 returns "" here instead, because this text is garbage for non-Chinese audio —
+            # revisit if a non-Chinese speaker is added.
             voice_item = item.get("voice_item") or {}
-            # Use it, but preserve the voice origin so the agent can distinguish this from text the user
-            # typed (#65022).
+            # Preserve the voice origin so the agent can distinguish this from text the user typed (#65022).
             voice_text = str(voice_item.get("text") or "")
-            if not (voice_item.get("media") or {}) and voice_text:
+            if voice_text:
                 return f"[Voice transcription provided by Weixin]\n{voice_text}"
     return ""
 
@@ -894,7 +928,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
         event = MessageEvent(
-            text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
+            text=text,
+            message_type=MessageType.VOICE if any(i.get("type") == ITEM_VOICE for i in item_list)
+            else _message_type_from_media(media_types, text),
+            source=source, raw_message=message,
             message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now())
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
         if event.message_type == MessageType.TEXT:
@@ -904,6 +941,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
         spec = _INBOUND_MEDIA.get(item.get("type"))
+        if spec and item.get("type") == ITEM_VOICE and str((item.get("voice_item") or {}).get("text") or "").strip():
+            # Weixin already transcribed it (and better than this box's whisper): keep the text as the body
+            # and skip the download so gateway/run.py's central STT doesn't add a second, worse transcript.
+            return
         path, mime = await self._download_media(item, spec) if spec else (None, "")
         if path:
             media_paths.append(path)
@@ -1108,12 +1149,30 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     ) -> SendResult:
         return await self._send_file_result(chat_id, file_path, caption or "", "send_document")
 
-    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
         return await self._send_file_result(chat_id, video_path, caption or "", "send_video")
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
-        # Native outbound voice bubbles are not proven-working upstream; a file attachment at least plays (even .silk).
-        return await self._send_file_result(chat_id, audio_path, caption or self.warning_text("[voice message as attachment]"), "send_voice", force_file_attachment=True)
+        # Weixin renders a native voice bubble only for SILK (encode_type=6); any other audio lands as a file
+        # attachment. Transcode with ffmpeg+pilk when available, and keep the file path as the fallback.
+        voice_path = audio_path
+        if not audio_path.endswith(".silk"):
+            try:
+                voice_path = await asyncio.to_thread(_to_weixin_silk, audio_path)
+            except Exception as exc:
+                logger.warning("[%s] voice transcode to silk failed (%s); sending as file", self.name, exc)
+                voice_path = audio_path
+        is_voice = voice_path.endswith(".silk")
+        result = await self._send_file_result(
+            chat_id, voice_path, "" if is_voice else (caption or "[voice message as attachment]"),
+            "send_voice", force_file_attachment=not is_voice,
+        )
+        if not result.success and is_voice:
+            logger.warning("[%s] native voice send failed (%s); retrying as file", self.name, result.error)
+            result = await self._send_file_result(
+                chat_id, audio_path, caption or "[voice message as attachment]", "send_voice", force_file_attachment=True,
+            )
+        return result
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
@@ -1148,7 +1207,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             "encrypt_query_param": encrypted_query_param, "aes_key_for_api": base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
             "ciphertext_size": len(ciphertext), "plaintext_size": rawsize, "filename": Path(path).name, "rawfilemd5": rawfilemd5}
         if media_type == MEDIA_VOICE and path.endswith(".silk"):
-            item_kwargs.update(encode_type=6, sample_rate=24000, bits_per_sample=16)
+            item_kwargs.update(encode_type=6, sample_rate=24000, bits_per_sample=16,
+                               playtime=_silk_duration_ms(path))
         item_lists: List[List[Dict[str, Any]]] = [[item_builder(**item_kwargs)]]
         if caption:
             item_lists.insert(0, [{"type": ITEM_TEXT, "text_item": {"text": self.format_message(caption)}}])

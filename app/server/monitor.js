@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execSync, execFile } from "child_process";
 import { createRequire } from "module";
 import { Readable } from "stream";
-import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync, statSync, symlinkSync, watch, chmodSync, chownSync, readdirSync, createReadStream, openSync, readSync, closeSync, rmSync, copyFileSync, appendFileSync } from "fs";
+import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync, statSync, symlinkSync, watch, chmodSync, chownSync, readdirSync, createReadStream, openSync, readSync, closeSync, rmSync, copyFileSync, appendFileSync, cpSync } from "fs";
 import { randomBytes } from "crypto";
 import { networkInterfaces } from "os";
 import { resolve as resolvePath, dirname, join } from "path";
@@ -386,7 +386,17 @@ function formatUptime(ms) {
   return parts.join(" ");
 }
 
-const GATEWAY_PORT   = Number(process.env.GATEWAY_PORT || "8742");
+// 网关端口跟随 data/.env 的 API_SERVER_PORT（本机 8787，接小爱音箱桥用），
+// 未设置时回落本包默认 8742。改 .env 端口后自动对齐，前端「是否连接」/重启 settle 探活跟着走。
+// ponytail: fpk 升级会覆盖本文件 → 升级后若 .env 端口非 8742，需重打这一处补丁。
+function _envGatewayPort() {
+  try {
+    const m = readFileSync(`${DATA_DIR}/.env`, "utf8").match(/^API_SERVER_PORT\s*=\s*(\d+)/m);
+    if (m && m[1]) return m[1];
+  } catch {}
+  return null;
+}
+const GATEWAY_PORT   = Number(process.env.GATEWAY_PORT || _envGatewayPort() || "8742");
 const UI_PORT        = Number(process.env.UI_PORT || "8650");
 const SOCKET_PATH    = (process.env.MONITOR_SOCKET_PATH || "").trim();
 if (!SOCKET_PATH) {
@@ -1036,6 +1046,16 @@ function checkToken(req) {
 
 
 const HERMES_TOKEN_MIRROR = `${DATA_DIR}/.monitor_token`;
+// monitor → 网关 的调用鉴权 key：网关实际用的是 data/.env 的 API_SERVER_KEY（它会覆盖下面
+// spawn env 注入的 MONITOR_TOKEN），所以这里跟着 .env 走，否则网关侧一律 401。
+// MONITOR_TOKEN 仍用于 monitor 自身 UI/API 的鉴权（下方 handleToken 校验处）。
+function _gatewayKey() {
+  try {
+    const m = readFileSync(`${DATA_DIR}/.env`, "utf8").match(/^API_SERVER_KEY\s*=\s*(\S+)/m);
+    if (m && m[1]) return m[1];
+  } catch {}
+  return MONITOR_TOKEN;
+}
 function syncTokenToHermesHome() {
   try { writeFileSync(HERMES_TOKEN_MIRROR, MONITOR_TOKEN, { mode: 0o600 }); }
   catch (e) { log(`同步 token 到 Hermes home 失败: ${e?.message || e}`); }
@@ -1177,7 +1197,7 @@ function getChatConfig() {
     const oldProviders = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")).providers || [];
     cfg.providers.forEach(p => {
       if (p.base_url === "LOCAL" || p.id === "hermes") {
-        p.api_key = MONITOR_TOKEN;
+        p.api_key = _gatewayKey();
         return;
       }
       const needsKeyRecovery = (p.api_key && p.api_key.startsWith("****") && !p.api_key.startsWith("****keep"))
@@ -1775,13 +1795,13 @@ async function fetchGatewayModels(provider) {
   const t0 = Date.now();
   try {
     const headers = {};
-    // LOCAL provider 必须用真实 MONITOR_TOKEN
+    // LOCAL provider 必须用真实网关 key（见 _gatewayKey）
     const isLocal = (provider.base_url === "LOCAL" || provider.id === "hermes");
     if (!isLocal && !provider.base_url) {
       return { models: [], latency: 0, error: 'base_url 未填写' };
     }
     if (isLocal) {
-      headers["Authorization"] = `Bearer ${MONITOR_TOKEN}`;
+      headers["Authorization"] = `Bearer ${_gatewayKey()}`;
     } else if (provider.api_key && provider.api_key !== "none") {
       headers["Authorization"] = `Bearer ${provider.api_key}`;
     }
@@ -1879,7 +1899,7 @@ async function autoTitle(userMsg, provider) {
 
 function resolveRealApiKey(provider) {
   if (provider.base_url === "LOCAL" || provider.id === "hermes") {
-    return MONITOR_TOKEN;
+    return _gatewayKey();
   }
   if (provider.api_key && !provider.api_key.startsWith("****")) {
     return provider.api_key;
@@ -1938,7 +1958,7 @@ function resolveMaxTokens(provider) {
 async function chatRequest(provider, message, history, reqSignal) {
   const providerBase = resolveProviderBase(provider);
   const isGateway = providerBase === GATEWAY_API.replace(/\/$/, "");
-  const apiKey = isGateway ? MONITOR_TOKEN : resolveRealApiKey(provider);
+  const apiKey = isGateway ? _gatewayKey() : resolveRealApiKey(provider);
   if (apiKey && apiKey !== "none" && !isGateway) {
     const officialEntry = Object.entries(PROVIDER_PRESETS).find(
       ([, v]) => v.base_url === provider.base_url
@@ -4709,7 +4729,7 @@ async function handleFetch(req) {
     let ok = false, err = null;
     try {
       const r = await fetch(`${GATEWAY_API}/models`, {
-        headers: { "Authorization": `Bearer ${MONITOR_TOKEN}` },
+        headers: { "Authorization": `Bearer ${_gatewayKey()}` },
         signal: AbortSignal.timeout(2000),
       });
       ok = r.ok;
@@ -8824,7 +8844,7 @@ async function handleFetch(req) {
       } catch (e) {}
       try {
         const gh = new Headers();
-        gh.set("Authorization", "Bearer " + MONITOR_TOKEN);
+        gh.set("Authorization", "Bearer " + _gatewayKey());
         const gr = await fetch(`http://${DASHBOARD_BIND}:${GATEWAY_PORT}/api/sessions`, { headers: gh, signal: AbortSignal.timeout(8000) });
         if (gr.ok) {
           const gdata = await gr.json();
@@ -8960,7 +8980,7 @@ async function handleFetch(req) {
       // ① Gateway 8742（hermes 会话主存储）
       try {
         const gh = new Headers();
-        gh.set("Authorization", "Bearer " + MONITOR_TOKEN);
+        gh.set("Authorization", "Bearer " + _gatewayKey());
         const gr = await fetch(`http://${DASHBOARD_BIND}:${GATEWAY_PORT}/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE", headers: gh, signal: AbortSignal.timeout(10000) });
         if (gr.ok) return new Response(JSON.stringify({ ok: true, via: "gateway" }), { headers: jsonHeaders() });
       } catch (e) {}

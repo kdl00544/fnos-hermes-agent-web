@@ -63,7 +63,13 @@ const EXCLUDE_TOP = new Set([
 // 官方已全部内建且更强（heartbeat refresher / event replay / keepalive /
 // ticket 走 WS subprotocol）；保留旧分叉反而让新 chat_ws 调不到
 // _start_backend_heartbeat_refresher → WS 握手即崩（网关永远"连接中"）。
-const PORT_OVERRIDES = new Set([]);
+const PORT_OVERRIDES = new Set([
+  // 本地移植补丁（2026-09-23 从部署端回迁，已按三方合并并入上游 0.21.4）：
+  // 这几个文件一旦上游再更新，官方改动不会自动进来，需要人工重做一次三方合并。
+  "gateway/platforms/weixin.py",   // silk 转码/原生语音气泡 + _silk_duration_ms playtime
+  "tools/tts_tool_providers.py",   // edge TTS pitch
+  "gateway/run_voice.py",          // 语音投递 playtime/日志收敛
+]);
 
 // ── 工具 ───────────────────────────────────────────────────────────
 function walk(dir, base) {

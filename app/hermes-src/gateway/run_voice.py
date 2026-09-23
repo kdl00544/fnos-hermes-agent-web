@@ -307,9 +307,13 @@ class GatewayVoiceMixin:
         # chat has no explicit mode; the chat-level all/voice_only/off choice takes precedence.
         if not (voice_mode == "all" or (voice_mode == "voice_only" and is_voice_input)
                 or (voice_mode is None and adapter_auto_tts)):
-            logger.debug(
-                "Auto voice reply skipped: mode=%s adapter_auto_tts=%s chat=%s platform=%s",
-                voice_mode, adapter_auto_tts, chat_id, event.source.platform.value)
+            # A skipped *voice* turn is worth a visible line: silence there is indistinguishable from a
+            # delivery failure (a voice-only chat suppresses nothing, but the user hears nothing either).
+            _log = logger.info if is_voice_input else logger.debug
+            _log(
+                "Auto voice reply skipped: mode=%s adapter_auto_tts=%s msg_type=%s chat=%s platform=%s",
+                voice_mode, adapter_auto_tts, getattr(event, "message_type", None), chat_id,
+                event.source.platform.value)
             return False
         # Dedup: agent already called the TTS tool in THIS turn (from the last user message on).
         start = next((i for i, m in reversed(list(enumerate(agent_messages)))
@@ -325,17 +329,18 @@ class GatewayVoiceMixin:
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply. The TTS tool
         may return one combined file or several separately valid ones (combination unavailable /
-        over a platform limit); legacy single-file results keep working."""
+        over a platform limit); legacy single-file results keep working. Returns True when audio was
+        delivered — callers use that to drop the duplicate text in voice-only chats."""
         audio_path, actual_paths = None, []
         try:
             from tools.tts_text_normalize import _strip_markdown_for_tts
             from tools.tts_tool import text_to_speech_tool
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
             audio_path = build_auto_tts_output_path(event.source.platform)
@@ -346,16 +351,18 @@ class GatewayVoiceMixin:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s",
                                raw[:200] if raw else raw)
-                return
+                return False
             candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
             paths = [str(p) for p in candidates if p and os.path.isfile(p)]
             if not result.get("success") or not paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
             actual_paths = paths
             await self._deliver_voice_reply(event, actual_paths)
+            return True
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 with suppress(OSError):
