@@ -20,12 +20,11 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 配置 git（publish/build 需要）
+      # 配置 git（build.sh 的 git describe/diff 需要；origin 由 checkout 注入，勿写死）
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config remote.origin.url "https://x-access-token:${GITHUB_TOKEN}@github.com/veenyi/fnos-hermes-agent-web.git"
           git tag --sort=-creatordate | head -3 || true
 
       # 检测上游版本 + 更新 VERSION（无新提交时脚本直接退出，后续步骤跳过）
