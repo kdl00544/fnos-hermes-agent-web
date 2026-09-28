@@ -69,6 +69,11 @@ cp -r app/server "$APP_STAGE/server"
 
 # 2. desktop-app（桌面端 Web：web-shim/index/assets，整目录含 i18n）
 cp -r app/desktop-app "$APP_STAGE/desktop-app"
+# 2.1 产物级补丁：修复上游 browser build 下 session owner 解析 bug
+#     （≥2 profile 时所有 session-scoped RPC 在前端本地被拒）。
+#     上游更新 desktop-app 产物会覆盖本地修改，故在暂存目录上重打一次；
+#     脚本幂等（已打则跳过），形态不匹配时 fail loud 让构建失败。
+node scripts/patch-desktop-app-session-owner.js --dir "$APP_STAGE/desktop-app"
 
 # 3. hermes-src（本地维护树，含全部修复；官方上游更新经 sync-upstream 合并进来）
 cp -r app/hermes-src "$APP_STAGE/hermes-src"
