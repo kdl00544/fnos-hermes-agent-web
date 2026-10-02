@@ -8,6 +8,17 @@
  *
  * 依赖注入:页面由 monitor serve 时注入 window.__HERMES_WEB_CONFIG__:
  *   { base: '/proxy/dashboard', token: '<session-token>', profile?: '<id>' }
+ *
+ * 2026-09-28 改动: getConnection(profile) / getConnectionFor({connectionId, profile})
+ * 现在把传入的 profile 透传给 mkConnection 建连接(并新增 name 字段,客户端存在
+ * profile: connection.name 的调用点);未传时仍回退 CONFIG.profile,保持原地语义。
+ * 此前 shim 丢弃 profile 参数,导致打开非激活档案(机器人对话)时会话恢复失败。
+ *
+ * 2026-09-28 改动(二): 会话 404 跨档案重试。客户端打开「别的 profile 的会话」时会带错
+ * profile(其跨档案路由有缺陷),服务端回 404,旧行为直接返回空壳 → 界面「恢复失败」。
+ * 现在对 GET /api/sessions/<id>... 的 404:先用 /api/profiles 列出档案(缓存 60s),逐个
+ * 换掉 path 里的 profile 重试,命中后把 sessionId→profile 记入 sessionProfileCache,后续
+ * 同会话请求直接带正确 profile;全部失败才回退原空壳。POST/PATCH/DELETE 一律不重试。
  */
 (function () {
   "use strict";
@@ -16,42 +27,187 @@
     // 未注入配置时仍安装桥,但 api/连接抛错,避免白屏
     CONFIG = { base: "/proxy/dashboard", token: "", profile: null };
   }
-  // [DIAG] boot 流量记录仪（临时）
-  window.__clog = [];
-  try {
-    var ow = console.warn, oe = console.error;
-    console.warn = function () { window.__clog.push('W:' + Array.prototype.map.call(arguments, String).join(' ').slice(0, 240)); return ow.apply(console, arguments); };
-    console.error = function () { window.__clog.push('E:' + Array.prototype.map.call(arguments, String).join(' ').slice(0, 240)); return oe.apply(console, arguments); };
-    window.addEventListener('hashchange', function () { window.__clog.push('HASH:' + location.hash.slice(0, 80)); });
-  } catch (e) {}
-  window.__wslog = [];
-  try {
-    var OW = window.WebSocket;
-    var WSlog = window.__wslog;
-    window.WebSocket = function (url, protocols) {
-      var ws = protocols !== undefined ? new OW(url, protocols) : new OW(url);
-      var rec = { k: 'ws-open', url: String(url).replace(/token=[^&]+/, 'token=***').slice(0, 140), t: Math.round(performance.now()), sent: [], got: [] };
-      WSlog.push(rec);
-      try {
-        var os = ws.send.bind(ws);
-        ws.send = function (d) { if (rec.sent.length < 40) rec.sent.push(String(d).slice(0, 160)); return os(d); };
-        ws.addEventListener('message', function (ev) { if (rec.got.length < 40) rec.got.push(String(ev.data).slice(0, 160)); });
-        ws.addEventListener('close', function (ev) { rec.close = ev.code + ' ' + (ev.reason || '').slice(0, 40); });
-        ws.addEventListener('error', function () { rec.err = 1; });
-      } catch (e) {}
-      return ws;
-    };
-    window.WebSocket.prototype = OW.prototype;
-    ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k, i) { window.WebSocket[k] = i; });
-    var OF = window.fetch;
-    window.fetch = function (u, o) {
-      var url = String(typeof u === 'string' ? u : (u && u.url) || '');
-      var rec = { k: 'fetch', url: url.replace(window.location.origin, '').slice(0, 130), m: (o && o.method) || 'GET', t: Math.round(performance.now()) };
-      return OF.apply(this, arguments).then(function (r) { rec.st = r.status; window.__wslog.push(rec); return r; }, function (e) { rec.st = 'ERR ' + String(e).slice(0, 60); window.__wslog.push(rec); throw e; });
-    };
-  } catch (e) {}
   var base = CONFIG.base.replace(/\/+$/, "");
   var token = CONFIG.token;
+
+  // ── 会话 404 跨档案重试(详见文件头 2026-09-28 改动(二))──
+  // 会话作用域判定: /api/sessions/<id> 后跟 "/"、"?" 或字符串结尾
+  // (= 规格中 /^\/api\/sessions\/[^\/?]+(\/|$)/ 与 ...(\?|$)/ 两条正则的并集)
+  var _SESSION_SCOPE_RE = /^\/api\/sessions\/[^\/?]+(\/|\?|$)/;
+  // sessionId → 命中档案(不过期;同一会话的档案归属不会变)
+  var sessionProfileCache = {};
+  // /api/profiles 列表缓存(60s;失败不缓存、不抛错)
+  var _profilesCache = { at: 0, ids: null };
+  // 进行中的 /api/profiles 请求:并发 404 共享同一个 promise,避免请求风暴
+  var _profilesInflight = null;
+  function _sessionIdOf(path) {
+    var m = /^\/api\/sessions\/([^\/?]+)/.exec(String(path || ""));
+    return m ? m[1] : null;
+  }
+  // 取当前 path 里的 profile 参数;没有则视为注入的默认档案
+  function _profileOf(path) {
+    try {
+      var i = String(path).indexOf("?");
+      if (i >= 0) {
+        var p = new URLSearchParams(String(path).slice(i + 1)).get("profile");
+        if (p) return p;
+      }
+    } catch (e) {}
+    return CONFIG.profile || "default";
+  }
+  // 把 path 里的 profile 换成 want,其余 query 原样保留
+  function _withProfile(path, want) {
+    var s = String(path), i = s.indexOf("?"), qs;
+    try { qs = new URLSearchParams(i >= 0 ? s.slice(i + 1) : ""); } catch (e) { qs = new URLSearchParams(); }
+    qs.set("profile", want);
+    return (i >= 0 ? s.slice(0, i) : s) + "?" + qs.toString();
+  }
+  // 把共享 promise 与调用方 signal 组合成「只对该调用者生效」的 promise:
+  // signal 已 abort → 立即 reject AbortError;否则监听 abort 事件,一旦 abort 就
+  // reject AbortError(并移除监听),原 promise 正常 settle 时也移除监听。
+  // 这样共享请求的成败由请求本身决定,不再被某个调用者的取消牵连。
+  function _abortable(promise, signal) {
+    function _abortErr() {
+      var e = new Error("Aborted");
+      e.name = "AbortError";
+      return e;
+    }
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(_abortErr());
+    if (typeof signal.addEventListener !== "function") return promise;
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      function onAbort() {
+        if (done) return;
+        done = true;
+        try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+        reject(_abortErr());
+      }
+      signal.addEventListener("abort", onAbort);
+      promise.then(function (v) {
+        if (done) return;
+        done = true;
+        try { signal.removeEventListener("abort", onAbort); } catch (e) {}
+        resolve(v);
+      }, function (e) {
+        if (done) return;
+        done = true;
+        try { signal.removeEventListener("abort", onAbort); } catch (e2) {}
+        reject(e);
+      });
+    });
+  }
+  // 取档案列表(带 60s 缓存 + 进行中去重);失败返回 null → 调用方走原有兜底,绝不抛错。
+  // 缓存条件:只有 /api/profiles 真正成功(2xx)且解析出对象才写 60s 缓存 —— 合法响应
+  // 含 profiles:[] 也算成功,空列表同样缓存,避免每次会话 404 重复打。
+  // 失败(非 2xx / JSON 解析失败 / 拿到 null)→ 返回 null 且不写缓存,下次可重试。
+  // 同一时刻只发一次 /api/profiles:并发调用共享同一个 promise,失败不缓存(下次可重试)。
+  // 本请求只带自带的 8s 超时,不接受调用方 signal:共享的 in-flight promise 绑定的是
+  // 「请求本身」而非某个调用者,任何调用者取消都不会把这批请求一起打成 AbortError。
+  // 调用方的取消语义由 _abortable 在各自调用点单独实现。
+  function _getProfileIds() {
+    var now = Date.now();
+    if (_profilesCache.ids && (now - _profilesCache.at) < 60000) {
+      return Promise.resolve(_profilesCache.ids);
+    }
+    if (_profilesInflight) return _profilesInflight;
+    var req = null;
+    try {
+      req = { headers: { "X-Hermes-Session-Token": token } };
+      // 仅自带 8s 兜底超时(与调用方 signal 解耦)
+      try { req.signal = AbortSignal.timeout(8000); } catch (e) {}
+    } catch (e) { return Promise.resolve(null); }
+    var p;
+    try {
+      p = fetch(base + "/api/profiles", req)
+        .then(function (r) {
+          if (!r || !r.ok) return null;
+          return r.json().catch(function () { return null; });
+        })
+        .then(function (d) {
+          // 区分「真成功」与「失败」:只有非 2xx 之外的响应且解析出对象才算成功。
+          // d 为 null 意味着上一段拿到了非 2xx(r.ok 为假)或 r.json() 解析失败,
+          // 此时必须返回 null 且不写缓存 —— 否则一次临时失败会被当成「空档案列表」
+          // 缓存 60s,缓存期内后续会话 404 不再跨 profile 重试,持续回退空壳。
+          if (!d || typeof d !== "object") return null;
+          var list = d.profiles || [];
+          var ids = [];
+          for (var i = 0; i < list.length; i++) {
+            var it = list[i];
+            if (!it) continue;
+            // 两套接口形态都兼容: monitor 的 /api/profiles 给 {id,name},
+            // dashboard 的 /proxy/dashboard/api/profiles 只给 {name}(= 档案 id)。
+            var pid = it.id != null ? it.id : it.name;
+            if (pid != null && String(pid)) ids.push(String(pid));
+          }
+          // 成功返回(含空列表 [])一律写缓存:空列表也是有效结果,
+          // 否则每次会话 404 都会重新打 /api/profiles,边界状态下请求放大。
+          _profilesCache = { at: Date.now(), ids: ids };
+          return ids;
+        })
+        .catch(function (e) {
+          // 请求失败(超时/网络)→ 返回 null 走原兜底;失败不缓存,下次可重试
+          return null;
+        });
+    } catch (e) { return Promise.resolve(null); }
+    // 收尾:清空 in-flight;失败(拿到 null)不缓存
+    _profilesInflight = p.then(function (ids) {
+      _profilesInflight = null;
+      return ids;
+    }, function (e) {
+      _profilesInflight = null;
+      return null;
+    });
+    return _profilesInflight;
+  }
+  // 逐个候选档案重试;第一个 res.ok 的直接返回(正常成功路径 res.json());
+  // 全部失败/无候选返回 null → 调用方走原有 404 兜底。候选数有限,最多一轮。
+  // 调用方超时语义:opts.signal 已 abort 或 fetch 抛 AbortError 时直接向外传播,
+  // 不再 next() 吞掉(否则超时会被静默降级成「恢复失败」空壳);其它错误照旧跳过。
+  function _retryAcrossProfiles(path, opts, sessionId, tried) {
+    function _isAbort(e) {
+      if (!e) return false;
+      if (e.name === "AbortError" || e.code === 20) return true;
+      var s = String(e && e.message || e);
+      return s.indexOf("aborted") >= 0 || s.indexOf("AbortError") >= 0;
+    }
+    // 共享的 profiles 请求与调用方取消解耦:_abortable 只让「本调用者」在
+    // abort 时立刻以 AbortError 结束等待(不再多等 profiles 的 8s),不影响同批其他调用者。
+    return _abortable(_getProfileIds(), opts && opts.signal).then(function (ids) {
+      if (opts && opts.signal && opts.signal.aborted) {
+        var ae0 = new Error("Aborted");
+        ae0.name = "AbortError";
+        throw ae0;
+      }
+      if (!ids || !ids.length) return null;
+      var cands = [];
+      for (var i = 0; i < ids.length; i++) {
+        if (ids[i] !== tried && cands.indexOf(ids[i]) < 0) cands.push(ids[i]);
+      }
+      var idx = 0;
+      function next() {
+        if (opts && opts.signal && opts.signal.aborted) {
+          var ae1 = new Error("Aborted");
+          ae1.name = "AbortError";
+          return Promise.reject(ae1);
+        }
+        if (idx >= cands.length) return null;
+        var cand = cands[idx++];
+        return fetch(base + _withProfile(path, cand), opts).then(function (res) {
+          if (res && res.ok) {
+            if (sessionId) sessionProfileCache[sessionId] = cand;
+            return res.json().catch(function () { return {}; });
+          }
+          return next();
+        }, function (e) {
+          // 超时/主动取消 → 传播,保持调用方超时语义;其余(网络抖动等)仍继续试下一个
+          if (_isAbort(e) || (opts && opts.signal && opts.signal.aborted)) throw e;
+          return next();
+        });
+      }
+      return next();
+    });
+  }
 
   
 
@@ -128,7 +284,8 @@
     return proto + "//" + location.host + base + "/api/ws?token=" + encodeURIComponent(token);
   }
 
-  function mkConnection() {
+  function mkConnection(profile) {
+    var p = (typeof profile === "string" && profile) ? profile : (CONFIG.profile || undefined);
     return {
       baseUrl: base,
       isFullscreen: false,
@@ -140,7 +297,8 @@
       logs: [],
       source: "env",
       windowButtonPosition: null,
-      profile: CONFIG.profile || undefined,
+      profile: p,
+      name: p,
     };
   }
 
@@ -214,6 +372,46 @@
       reader.onerror = function () { resolve(null); };
       if (asDataUrl) reader.readAsDataURL(file); else reader.readAsText(file);
     });
+  }
+
+  // ── 本机 agent 名单（2026-09-29 改动四）────────────────────────────────────
+  // 客户端 Bot Mode 用 host.agents() 枚举「所有已注册连接上的 agent」，给本机其它
+  // profile 的机器人行打 sourceScoped；少了它，点机器人「新开对话」时
+  // botConnectionRoute() 得 null，会误报「Update Hermes Desktop to open another
+  // Bot chat.」（判据见 assets 里 ZE()/HD()）。web 形态只有一个连接，本机全部
+  // profile 都报成 connectionKind:"local"（与 data.ts mergeMultiSourceRoster 里
+  // activeId 为空时的回退规则一致，因此只 annotate 富行、不会产生重复机器人）。
+  // sources 留空：非空但行里 connectionId 不在其中会被标 sourceMissing。
+  var _LOCAL_CONN = "local";
+  var _agentCache = { at: 0, data: null };
+  function _agentUnion() {
+    var now = Date.now();
+    if (_agentCache.data && now - _agentCache.at < 60000) return Promise.resolve(_agentCache.data);
+    return fetch(base + "/api/profiles", { headers: { "X-Hermes-Session-Token": token }, cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var list = d && (d.profiles || d.rows || d);
+        if (!Array.isArray(list)) list = [];
+        var agents = [];
+        for (var i = 0; i < list.length; i++) {
+          var p = list[i] || {};
+          // monitor 形态给 {id,name}(name 是显示名)，dashboard 形态 name 就是档案 id
+          var id = String(p.id || p.profile || p.name || "").trim();
+          if (!id) continue;
+          agents.push({
+            connectionId: _LOCAL_CONN,
+            connectionKind: "local",
+            connectionLabel: "本机",
+            profile: id,
+            handle: id.toLowerCase() === "default" ? "hermes" : id,
+            targetProfile: id
+          });
+        }
+        var out = { primaryConnectionId: _LOCAL_CONN, agents: agents, sources: [] };
+        _agentCache = { at: now, data: out };
+        return out;
+      })
+      .catch(function () { return { primaryConnectionId: _LOCAL_CONN, agents: [], sources: [] }; });
   }
 
   var core = {
@@ -354,6 +552,14 @@
       if (request.timeoutMs) {
         try { opts.signal = AbortSignal.timeout(request.timeoutMs); } catch (e) {}
       }
+      // 已学会的 sessionId→profile 映射:发送前直接改用正确档案,避免再吃一次 404
+      // (仅 GET + 会话作用域;映射与该请求带的 profile 不一致时才替换)
+      var _sid = null;
+      if (opts.method === "GET" && _SESSION_SCOPE_RE.test(path)) {
+        _sid = _sessionIdOf(path);
+        var _mapped = _sid ? sessionProfileCache[_sid] : null;
+        if (_mapped && _profileOf(path) !== _mapped) path = _withProfile(path, _mapped);
+      }
       return fetch(base + path, opts).then(function (res) {
         if (path === "/api/config") {
           return res.clone().json().then(function (d) {
@@ -365,8 +571,18 @@
         }
         if (!res.ok) {
           if (path === "/api/config") { return { display: { language: "zh" } }; }
-          // 会话 404(重装后旧会话 ID 残留):返回空,不报错不刷屏
+          // 会话 404(重装后旧会话 ID 残留):返回空,不报错不刷屏。
+          // 仅 GET + 会话作用域才先跨档案重试(客户端可能带了错档案);POST/PATCH/DELETE
+          // 不重试(避免重发 body),直接走原兜底。重试全败也回退原兜底。
           if (res.status === 404 && /\/api\/sessions\//.test(path)) {
+            if (opts.method === "GET" && _SESSION_SCOPE_RE.test(path)) {
+              var _s404 = _sid || _sessionIdOf(path);
+              var _tried = _profileOf(path);
+              return _retryAcrossProfiles(path, opts, _s404, _tried).then(function (data) {
+                if (data !== null) return data;      // 命中档案 → 正常成功路径
+                return { session: null, messages: [], sessions: [] };
+              });
+            }
             return { session: null, messages: [], sessions: [] };
           }
           var err = new Error("HTTP " + res.status + " " + res.statusText);
@@ -380,8 +596,11 @@
     },
 
     // ── 连接 ──
-    getConnection: function () { return Promise.resolve(mkConnection()); },
-    getConnectionFor: function () { return Promise.resolve(mkConnection()); },
+    getConnection: function (profile) { return Promise.resolve(mkConnection(profile)); },
+    getConnectionFor: function (arg) {
+      var p = typeof arg === "string" ? arg : (arg && typeof arg === "object" ? arg.profile : undefined);
+      return Promise.resolve(mkConnection(p));
+    },
     getGatewayWsUrl: function () { return Promise.resolve({ ok: true, wsUrl: wsUrlFor() }); },
     getGatewayWsUrlFor: function () { return Promise.resolve({ ok: true, wsUrl: wsUrlFor() }); },
     getConnectionConfig: function () {
@@ -396,7 +615,8 @@
     getProfileRoutes: function () { return Promise.resolve({}); },
     revalidateConnection: function () { return Promise.resolve(mkConnection()); },
     touchBackend: function () { return Promise.resolve({ ok: true }); },
-    getAgentRoster: function () { return Promise.resolve([]); },
+    getAgentRoster: function () { return _agentUnion(); },
+    agents: function () { return _agentUnion(); },
     getActiveProfile: function () { return Promise.resolve({ profile: CONFIG.profile || null }); },
 
     // ── 连接配置(web 仅支持当前注入连接) ──
@@ -756,16 +976,29 @@
     }
   }
   function run() { try { translate(document.body); } catch (e) {} }
-  var obs = null;
-  function start() {
-    if (obs) return;
-    obs = new MutationObserver(function () {
+  // 2026-09-28 改动(三)：节流。原来「每次 DOM 变动 + 每 500ms」都全树翻译一遍，
+  // 流式回复时 MutationObserver 每秒触发几十次全文档 TreeWalker + shadowRoot 的
+  // querySelectorAll('*')，主线程被打满 → 会话越长切/翻越卡。现合并为最多每 400ms
+  // 一遍（尾随），定时器降为 5s 兜底。命中次数见 window.__shimStats。
+  if (!window.__shimStats) window.__shimStats = { translatePasses: 0, scheduled: 0 };
+  var _t = 0;
+  function schedule() {
+    window.__shimStats.scheduled++;
+    if (_t) return;
+    _t = setTimeout(function () {
+      _t = 0;
+      window.__shimStats.translatePasses++;
       if (obs) obs.disconnect();
       try { run(); } catch (e) {}
       if (obs) obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    });
+    }, 400);
+  }
+  var obs = null;
+  function start() {
+    if (obs) return;
+    obs = new MutationObserver(function () { schedule(); });
     obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    setInterval(function () { try { translate(document.body); } catch (e) {} }, 500);
+    setInterval(schedule, 5000);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () { run(); start(); });
@@ -811,12 +1044,23 @@
       }
     }
   }
+  // 2026-09-28 改动(三)：与汉化层同因——全树文本扫描不能再跟着每次变动跑。
+  var _tV = 0;
+  function scheduleVer() {
+    if (_tV) return;
+    _tV = setTimeout(function () {
+      _tV = 0;
+      if (obs) obs.disconnect();
+      applyVer();
+      if (obs) obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    }, 400);
+  }
   var obs = null;
   function start() {
     if (obs) return;
-    obs = new MutationObserver(function () { if (obs) obs.disconnect(); applyVer(); if (obs) obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true }); });
+    obs = new MutationObserver(function () { scheduleVer(); });
     obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    setInterval(applyVer, 800);
+    setInterval(scheduleVer, 5000);
   }
   if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function () { fetchVersion(); start(); }); }
   else { fetchVersion(); start(); }
@@ -885,12 +1129,17 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", fixTz);
   }
-  var obsTz = null;
+  // 2026-09-28 改动(三)：querySelectorAll 也是全文档遍历，同样节流。
+  var obsTz = null, _tTz = 0;
+  function scheduleTz() {
+    if (_tTz) return;
+    _tTz = setTimeout(function () { _tTz = 0; fixTz(); }, 500);
+  }
   try {
-    obsTz = new MutationObserver(function () { fixTz(); });
+    obsTz = new MutationObserver(function () { scheduleTz(); });
     obsTz.observe(document.documentElement, { childList: true, subtree: true });
   } catch (e) {}
-  setInterval(fixTz, 1200);
+  setInterval(fixTz, 5000);
 })();
 
 
@@ -920,12 +1169,17 @@
     } catch (e) {}
   }
   fixPets();
-  var obsP = null;
+  // 2026-09-28 改动(三)：同上，全文档 querySelectorAll 节流。
+  var obsP = null, _tP = 0;
+  function schedulePets() {
+    if (_tP) return;
+    _tP = setTimeout(function () { _tP = 0; fixPets(); }, 600);
+  }
   try {
-    obsP = new MutationObserver(function () { fixPets(); });
+    obsP = new MutationObserver(function () { schedulePets(); });
     obsP.observe(document.documentElement, { childList: true, subtree: true });
   } catch (e) {}
-  setInterval(fixPets, 1500);
+  setInterval(fixPets, 5000);
 })();  // [randomUUID-polyfill] 非安全上下文（LAN http）缺 crypto.randomUUID，
   // SPA 附件身份（createComposerAttachmentOccurrenceId）会抛 TypeError 被吞 →
   // 图片附件静默丢失。用 getRandomValues（非安全上下文可用）补 v4 UUID。
@@ -942,3 +1196,43 @@
     }
   } catch (e) {}
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+/**
+ * 2026-09-28 改动(三): 浏览器里隐藏只有 Electron 才成立的 titlebar 工具。
+ *
+ * hud / flip-panes / right-sidebar 在桌面端分别是「独立原生小窗」「原生 pane 布局
+ * 翻转」「装原生终端与 <webview> 的右侧栏」。浏览器里没有对应实现,点开只剩一个关闭
+ * 按钮,徒增困惑 —— 这里在 web 环境直接把这三个从标题栏摘掉。
+ *
+ * 定位用图标 class(codicon-*),不用 aria-label —— label 会随语言变。
+ * 要它们回来: localStorage.setItem('hermes.web.showNativeTools','1') 再刷新。
+ */
+(function () {
+  try {
+    if (localStorage.getItem('hermes.web.showNativeTools') === '1') {
+      return;
+    }
+    var ID = 'hermes-web-hide-native-tools';
+    var CSS =
+      'button:has(.codicon-arrow-swap),' +
+      'button:has(.codicon-comment-discussion),' +
+      'button[data-tour="right-pane-toggle"]{display:none !important}';
+    function install() {
+      if (document.getElementById(ID)) {
+        return;
+      }
+      var st = document.createElement('style');
+      st.id = ID;
+      st.textContent = CSS;
+      (document.head || document.documentElement).appendChild(st);
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', install);
+    } else {
+      install();
+    }
+  } catch (e) {}
+})();
