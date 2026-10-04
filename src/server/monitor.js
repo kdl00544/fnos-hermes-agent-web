@@ -785,6 +785,19 @@ function _replaceTopLevelKey(raw, key, block) {
 }
 
 // 模块级自动注册：直接操作文件，不依赖 handleFetch 内部函数
+// YAML 双引号标量深度反转义（迭代到稳定）。
+// 旧实现把带引号的原文直接回写，反斜杠每轮翻倍，config.yaml 指数膨胀
+// （曾达 268MB）并拖垮 Gateway 事件循环。
+function _mcpUnquoteDeep(v) {
+  let cur = String(v == null ? "" : v).trim();
+  for (let i = 0; i < 32; i++) {
+    if (cur.length < 2 || cur[0] !== '"' || cur[cur.length - 1] !== '"') break;
+    const next = cur.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
 function _moduleParseMcpServers(yml) {
   const out = {};
   const s = String(yml || "");
@@ -795,13 +808,21 @@ function _moduleParseMcpServers(yml) {
     const mEnd = s.match(/^mcp_servers:\s*\n([\s\S]*)$/m);
     if (mEnd) block = mEnd[1];
   }
-  let cur = null;
+  let cur = null, inList = null;
   block.split("\n").forEach(l => {
     const km = l.match(/^  ([a-zA-Z0-9_\-]+):\s*$/);
-    if (km) { cur = km[1]; out[cur] = {}; return; }
-    if (cur && /^    \S/.test(l)) {
-      const vm = l.match(/^    (\S+):\s*(.*)$/);
-      if (vm) out[cur][vm[1]] = vm[2].trim();
+    if (km) { cur = km[1]; out[cur] = {}; inList = null; return; }
+    if (!cur) return;
+    const vm = l.match(/^    ([A-Za-z0-9_\-]+):\s*(.*)$/);
+    if (vm) {
+      inList = vm[2].trim() === "" ? vm[1] : null;
+      out[cur][vm[1]] = _mcpUnquoteDeep(vm[2]);
+      return;
+    }
+    const li = inList && l.match(/^      -\s*(.*)$/);
+    if (li) {
+      if (!Array.isArray(out[cur][inList])) out[cur][inList] = [];
+      out[cur][inList].push(_mcpUnquoteDeep(li[1]));
     }
   });
   return out;
@@ -6701,7 +6722,7 @@ async function handleFetch(req) {
         const k = sk[1], v = sk[2].trim();
         inMap = null;
         if (v === ""){ curEntry[k] = null; inMap = k; }
-        else { curEntry[k] = v; }
+        else { curEntry[k] = _mcpUnquoteDeep(sk[2]); }
         continue;
       }
       // 6 空格 key: value（子 map 成员：headers/env 等）
@@ -6709,9 +6730,7 @@ async function handleFetch(req) {
       if (hk && curEntry && inMap){
         if (curEntry[inMap] === null || curEntry[inMap] === undefined) curEntry[inMap] = {};
         else if (Array.isArray(curEntry[inMap])) curEntry[inMap] = {};
-        let hv = hk[2].trim();
-        if ((hv.startsWith('"') && hv.endsWith('"')) || (hv.startsWith("'") && hv.endsWith("'"))) hv = hv.slice(1, -1);
-        curEntry[inMap][hk[1]] = hv;
+        curEntry[inMap][hk[1]] = _mcpUnquoteDeep(hk[2]);
         continue;
       }
       // 6 空格 - item（子列表成员：args 等）
@@ -6719,9 +6738,7 @@ async function handleFetch(req) {
       if (li && curEntry && inMap){
         if (curEntry[inMap] === null || curEntry[inMap] === undefined) curEntry[inMap] = [];
         else if (!Array.isArray(curEntry[inMap])) curEntry[inMap] = [];
-        let val = li[1].trim();
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
-        curEntry[inMap].push(val);
+        curEntry[inMap].push(_mcpUnquoteDeep(li[1]));
         continue;
       }
     }
