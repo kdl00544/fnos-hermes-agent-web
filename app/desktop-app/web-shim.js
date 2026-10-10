@@ -677,7 +677,10 @@
     // 错误恢复页的"修复安装":触发 monitor 重启 gateway+dashboard(后端修复)
     // 注意:/api/app/* 是 monitor 级路由,不走 /proxy/dashboard 代理
     repairBootstrap: function () {
-      return fetch("/api/app/repair", {
+      // 2026-10-02 修: 原先写死根绝对路径 "/api/app/repair"，在 fnOS 网关前缀
+      // (BASE_PATH=/app/hermes-agent) 下会打到网关门上 → 404「修复安装」静默失败；
+      // 这里改走 monitor 注入的 base（与同闭包内 base + "/api/app/*" 调用一致）
+      return fetch(base + "/api/app/repair", {
         method: "POST",
         headers: { "X-Monitor-Token": token },
         signal: AbortSignal.timeout(15000),
