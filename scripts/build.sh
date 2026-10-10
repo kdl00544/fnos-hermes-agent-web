@@ -105,6 +105,24 @@ if [ -f "fpk/manifest" ]; then
   sed -i "s/^version.*=.*/version               = $CUR_VERSION/" fpk/manifest
 fi
 
+# 6.5 install-stamp.json —— 0.21.6 起运行时身份只认这个戳
+# 上游把 pyproject 与 hermes_cli/__init__ 的版本都改成惰性占位（0.0.0），
+# version_info.get_version_info() 只读 ①安装戳 ②live git；打包树两样都没有
+# → hermes --version 显示 vunknown（纯显示问题，但桌面端/CLI 的版本判断跟着瞎）。
+# 用上游自带脚本生成，字段口径与官方 Docker/Nix/桌面端打包一致。
+if [ -f "$APP_STAGE/hermes-src/scripts/write_install_stamp.py" ]; then
+  UP_SHA="$(sed -n 's/.*PREV_SHA="\([0-9a-f]\{7,\}\)".*/\1/p' .upstream-state 2>/dev/null | head -1)"
+  STAMP_ARGS=(--branch main --base-version "$CUR_VERSION" --display-version "$CUR_VERSION"
+              --distance 0 --source local --update-mechanism app-installer)
+  [ -n "$UP_SHA" ] && STAMP_ARGS+=(--commit "$UP_SHA")
+  if python3 "$APP_STAGE/hermes-src/scripts/write_install_stamp.py" \
+       -o "$APP_STAGE/hermes-src/install-stamp.json" "${STAMP_ARGS[@]}" >/dev/null 2>&1; then
+    echo "✓ install-stamp.json 已生成（$CUR_VERSION${UP_SHA:+, $UP_SHA}）"
+  else
+    echo "⚠ install-stamp.json 生成失败（hermes --version 会显示 vunknown）"
+  fi
+fi
+
 # ── 组装完整 FPK ────────────────────────────────────────────────────
 echo "── 打包完整 FPK ──"
 # FPK 结构：manifest + app.tgz + cmd + config + ICON + LICENSE + wizard
