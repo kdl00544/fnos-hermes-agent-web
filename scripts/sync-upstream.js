@@ -45,21 +45,48 @@ function curl(url) {
 
 console.log('═══ 检测上游', UPSTREAM_REPO, '═══');
 
-// ── 获取官方版本（pyproject.toml 权威）────────────────────────────
+// ── 同步基准 ref（workflow 可用 SYNC_REF 钉版本，缺省 main）────────
+const REF = (process.env.SYNC_REF || 'main').trim() || 'main';
+if (REF !== 'main') console.log('同步基准 ref:', REF);
+
+// ── 获取官方版本 ───────────────────────────────────────────────────
+// 2026-10-10：官方 pyproject.toml 的 version 已固定为占位 "0.0.0"（真实版本由发布流程/安装
+// 戳注入，hermes_cli/__init__.py 现在只留 __release_date__）。继续解析 pyproject 会拿到
+// 0.0.0 → 版本号退化成 0.0.0.1，把整条版本线带偏。改以 GitHub releases 的语义化 tag 为准
+// （/releases/latest 可能给到日期 tag v2026.9.24，所以取最近 30 个 release 里最高的 x.y.z），
+// releases 拿不到时才退回 pyproject（并排除占位 0.0.0）。
+function verKey(v) {
+  return v.split('.').reduce((a, n) => a * 100000 + (parseInt(n, 10) || 0), 0);
+}
+function verFromPyproject(txt) {
+  const m = String(txt).match(/^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/m);
+  return m && m[1] !== '0.0.0' ? m[1] : '';
+}
 let LATEST_VER = '';
 try {
-  const py = curl(`https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/pyproject.toml`);
-  const m = py.match(/^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/m);
-  LATEST_VER = m ? m[1] : '';
-} catch (e) { console.log('⚠ raw.githubusercontent.com 获取失败:', e.message.slice(0, 80)); }
+  const rel = JSON.parse(curl(`https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=30`));
+  if (Array.isArray(rel)) {
+    const sem = rel.map(r => String(r.tag_name || '').replace(/^v/, ''))
+                   .filter(v => /^\d+\.\d+\.\d+$/.test(v));
+    if (sem.length) {
+      LATEST_VER = sem.sort((a, b) => verKey(b) - verKey(a))[0];
+      console.log('（版本取自 GitHub releases 语义化 tag）');
+    }
+  }
+} catch (e) { console.log('⚠ releases API 获取失败:', e.message.slice(0, 80)); }
+if (!LATEST_VER) {
+  console.log('⚠ releases 里没有语义化 tag，退回 pyproject 解析（ref =', REF, '）');
+  try {
+    LATEST_VER = verFromPyproject(curl(`https://raw.githubusercontent.com/${UPSTREAM_REPO}/${REF}/pyproject.toml`));
+  } catch (e) { console.log('⚠ raw.githubusercontent.com 获取失败:', e.message.slice(0, 80)); }
+}
 if (!LATEST_VER) {
   // fallback：api.github.com contents API（CI 网络 raw 域名不稳时兜底）
   try {
-    const py2 = curl(`https://api.github.com/repos/${UPSTREAM_REPO}/contents/pyproject.toml?ref=main`);
+    const py2 = curl(`https://api.github.com/repos/${UPSTREAM_REPO}/contents/pyproject.toml?ref=${REF}`);
     let content = py2;
     try { content = Buffer.from(JSON.parse(py2).content || "", "base64").toString("utf8"); } catch {}
-    const m2 = content.match(/^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/m);
-    LATEST_VER = m2 ? m2[1] : '';
+    LATEST_VER = verFromPyproject(content);
     if (LATEST_VER) console.log('（经 api.github.com 获取）');
   } catch (e2) { console.log('⚠ api.github.com 兜底也失败:', e2.message.slice(0, 80)); }
 }
@@ -69,14 +96,14 @@ if (!LATEST_VER) {
 }
 console.log('官方最新版本:', LATEST_VER);
 
-// ── 获取上游 main 最新 commit sha ─────────────────────────────────
+// ── 获取上游基准 ref 最新 commit sha ──────────────────────────────
 let LATEST_SHA = '';
 try {
-  const info = JSON.parse(curl(`https://api.github.com/repos/${UPSTREAM_REPO}/commits/main`));
+  const info = JSON.parse(curl(`https://api.github.com/repos/${UPSTREAM_REPO}/commits/${REF}`));
   LATEST_SHA = info.sha || '';
 } catch (e) { console.log('⚠ 无法获取 commit sha:', e.message.slice(0, 80)); }
 if (!LATEST_SHA) { console.log('⚠ 无法获取上游 commit，跳过变更检测'); LATEST_SHA = 'unknown'; }
-console.log('上游 main commit:', LATEST_SHA.slice(0, 12));
+console.log(`上游 ${REF} commit:`, LATEST_SHA.slice(0, 12));
 
 // ── 读取上次同步状态 ──────────────────────────────────────────────
 let PREV_SHA = '';

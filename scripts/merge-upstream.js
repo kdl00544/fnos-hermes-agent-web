@@ -35,6 +35,10 @@ const INCLUDE_TOP = new Set([
   'hermes_cli', 'tui_gateway', 'agent', 'gateway', 'providers', 'skills', 'tools',
   'plugins', 'cron', 'acp_adapter', 'locales', 'optional-mcps', 'optional-skills',
   'datagen-config-examples', 'docker', 'nix', 'scripts',
+  // 0.21.6 起上游新增的运行时目录：漏掉就会像 0.21.1 那次一样载荷缺文件，
+  // 网关启动即 ModuleNotFoundError（pm = 包管理器实现，hermes_platform = 平台抽象，
+  // plugin-catalog = 插件目录数据）。根目录顶层 .py 模块本来就会自动收录。
+  'pm', 'hermes_platform', 'plugin-catalog',
   'cli.py', 'run_agent.py', 'hermes', 'hermes_bootstrap.py', 'hermes_constants.py',
   'hermes_logging.py', 'hermes_state.py', 'hermes_state_common.py', 'hermes_state_portability.py',
   'hermes_state_schema.py', 'hermes_state_search.py', 'hermes_time.py', 'setup.py',
