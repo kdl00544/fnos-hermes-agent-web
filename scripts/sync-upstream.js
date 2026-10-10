@@ -52,11 +52,12 @@ if (REF !== 'main') console.log('同步基准 ref:', REF);
 // ── 获取官方版本 ───────────────────────────────────────────────────
 // 2026-10-10：官方 pyproject.toml 的 version 已固定为占位 "0.0.0"（真实版本由发布流程/安装
 // 戳注入，hermes_cli/__init__.py 现在只留 __release_date__）。继续解析 pyproject 会拿到
-// 0.0.0 → 版本号退化成 0.0.0.1，把整条版本线带偏。改以 GitHub releases 的语义化 tag 为准
-// （/releases/latest 可能给到日期 tag v2026.9.24，所以取最近 30 个 release 里最高的 x.y.z），
-// releases 拿不到时才退回 pyproject（并排除占位 0.0.0）。
-function verKey(v) {
-  return v.split('.').reduce((a, n) => a * 100000 + (parseInt(n, 10) || 0), 0);
+// 0.0.0 → 版本号退化成 0.0.0.1，把整条版本线带偏。改以 GitHub releases 的语义化 tag 为准。
+// 坑：官方的日期 tag（v2026.9.24）长得也像 x.y.z，按“数值最大”会把它选成 2026.9.24 ——
+// 所以按 release 时间倒序取**第一个**语义化 tag，并把 major >= 100 的日期 tag 排除。
+function isSemverTag(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v);
+  return !!m && parseInt(m[1], 10) < 100;
 }
 function verFromPyproject(txt) {
   const m = String(txt).match(/^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/m);
@@ -66,11 +67,11 @@ let LATEST_VER = '';
 try {
   const rel = JSON.parse(curl(`https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=30`));
   if (Array.isArray(rel)) {
-    const sem = rel.map(r => String(r.tag_name || '').replace(/^v/, ''))
-                   .filter(v => /^\d+\.\d+\.\d+$/.test(v));
-    if (sem.length) {
-      LATEST_VER = sem.sort((a, b) => verKey(b) - verKey(a))[0];
-      console.log('（版本取自 GitHub releases 语义化 tag）');
+    // /releases 按发布时间倒序：取第一个语义化 tag = 最新语义化发布
+    const hit = rel.map(r => String(r.tag_name || '').replace(/^v/, '')).find(isSemverTag);
+    if (hit) {
+      LATEST_VER = hit;
+      console.log('（版本取自 GitHub releases 最新语义化 tag）');
     }
   }
 } catch (e) { console.log('⚠ releases API 获取失败:', e.message.slice(0, 80)); }
