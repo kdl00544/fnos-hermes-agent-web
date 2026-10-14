@@ -265,16 +265,12 @@ class MCPServerRunMixin:
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
         # The _MCP_*_TYPES flags are False until the lazy SDK import runs.
         _core._ensure_mcp_sdk()
-        # `config.get(k, {})` keeps an explicit `sampling: null` as None: the desktop MCP settings
-        # page writes `sampling: null` / `elicitation: null` for an untouched entry, and the
-        # `.get("enabled")` below then raised AttributeError inside the run task — every connect
-        # burned the full connect_timeout and the server never came up.
-        sampling_config = config.get("sampling") or {}
+        sampling_config = config.get("sampling", {})
         self._sampling = (_sampling.SamplingHandler(self.name, sampling_config)
                           if sampling_config.get("enabled", True) and _core._MCP_SAMPLING_TYPES else None)
         # elicitation/create lets a server ask for structured input mid-call; the handler
         # routes it through Hermes' approval system.
-        elicitation_config = config.get("elicitation") or {}
+        elicitation_config = config.get("elicitation", {})
         self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config,
                                                        call_context=lambda: self._pending_call_context)
                              if elicitation_config.get("enabled", True) and _core._MCP_ELICITATION_TYPES else None)
