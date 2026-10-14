@@ -21,12 +21,8 @@ CUR_VERSION="$(cat VERSION | tr -d '[:space:]')"
 OFFICIAL_VER="$(echo "$CUR_VERSION" | cut -d. -f1-3)"
 BUILD_NUM="$(echo "$CUR_VERSION" | awk -F. '{print $NF}')"
 
-# 上一版本（从 git tag 取最近的非当前 tag）
-PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
-if [ "$PREV_TAG" = "v$CUR_VERSION" ]; then
-  # 当前版本已是 tag（可能是手动构建），用 git log 找上一个 tag
-  PREV_TAG="$(git tag --sort=-creatordate | grep -v "^v$CUR_VERSION$" | head -1 || echo "")"
-fi
+# 上一版本（从 git tag 取最近的语义化版本 tag；排除 v0.21.7-deploy 这类部署快照 tag）
+PREV_TAG="$(git tag --sort=-creatordate | grep -E '^v[0-9]+(\.[0-9]+)+$' | grep -v "^v$CUR_VERSION$" | head -1 || echo "")"
 PREV_VERSION="${PREV_TAG#v}"
 PREV_VERSION="${PREV_VERSION:-}"
 
@@ -168,12 +164,17 @@ echo "── 打包完整 FPK ──"
 # ── 生成增量更新包 ──────────────────────────────────────────────────
 echo "── 生成增量更新包 ──"
 if [ -n "$PREV_VERSION" ] && [ "$PREV_TAG" != "v$CUR_VERSION" ]; then
-  CHANGED_FILES="$(git diff --name-only "$PREV_TAG" HEAD -- app/ 2>/dev/null || true)"
+  CHANGED_FILES="$(git diff --name-only --diff-filter=ACMR "$PREV_TAG" HEAD -- app/ 2>/dev/null || true)"
   if [ -n "$CHANGED_FILES" ]; then
     INC_STAGE="$BUILD_DIR/inc-stage"
     rm -rf "$INC_STAGE"
     mkdir -p "$INC_STAGE"
     for f in $CHANGED_FILES; do
+      # 兜底：上游删除的文件不该出现在增量包里，万一漏进来就跳过（monitor 热更只覆盖文件，不会删文件）
+      if [ ! -f "$f" ]; then
+        echo "· 增量跳过（工作树无此文件）: $f"
+        continue
+      fi
       case "$f" in
         app/server/*)            DEST="$INC_STAGE/server/$(basename "$f")" ;;
         app/desktop-app/*)       DEST="$INC_STAGE/desktop-app/${f#app/desktop-app/}" ;;
