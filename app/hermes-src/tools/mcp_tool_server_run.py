@@ -265,7 +265,7 @@ class MCPServerRunMixin:
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
         # The _MCP_*_TYPES flags are False until the lazy SDK import runs.
         _core._ensure_mcp_sdk()
-        sampling_config = config.get("sampling", {})
+        sampling_config = config.get("sampling") or {}
         self._sampling = (_sampling.SamplingHandler(self.name, sampling_config)
                           if sampling_config.get("enabled", True) and _core._MCP_SAMPLING_TYPES else None)
         # elicitation/create lets a server ask for structured input mid-call; the handler

@@ -73,6 +73,9 @@ const PORT_OVERRIDES = new Set([
   "gateway/platforms/weixin.py",   // silk 转码/原生语音气泡 + _silk_duration_ms playtime
   "tools/tts_tool_providers.py",   // edge TTS pitch
   "gateway/run_voice.py",          // 语音投递 playtime/日志收敛
+  // 0.22.0 受控合并丢过一次（CI run 38547810557 覆盖回上游坏版），2026-10-14 加固：
+  "tui_gateway/methods_onboarding.py",  // 上游 0.22.0 缺 from pathlib import Path → dashboard 启动 NameError
+  "tools/mcp_tool_server_run.py",       // sampling 读侧 or {} 容错（monitor 拍平嵌套后 sampling=None 防崩）
 ]);
 
 // ── 工具 ───────────────────────────────────────────────────────────
