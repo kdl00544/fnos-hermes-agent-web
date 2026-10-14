@@ -1,0 +1,1 @@
+import{t as e}from"./atom-DPaP1HVd.js";import{l as t,r as n}from"./storage-Qfg3Ykci.js";import{g as r}from"./panes-T2z2ufU8.js";var i=`hermes.desktop.terminalTakeover`,a=e(t(i,!1));a.subscribe(e=>n(i,e));var o=r(`terminalOpen`,a,e=>a.set(e)),s=e=>o.set(e),c=e(null),l=e=>{let t=e.trim();t&&(s(!0),c.set(t))};export{s as i,o as n,l as r,c as t};

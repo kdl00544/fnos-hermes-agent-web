@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Telegram 登录二维码（实时刷新）</title>
+<style>
+  body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;margin:0;padding:24px;background:#111;color:#eee;text-align:center}
+  h1{font-size:17px;font-weight:600;margin:0 0 6px}
+  .hint{font-size:13px;color:#9aa; line-height:1.7;margin-bottom:14px}
+  img{width:300px;height:300px;background:#fff;padding:10px;border-radius:10px;display:block;margin:0 auto}
+  #st{font-size:12px;color:#8a8;margin-top:10px}
+  #ask{display:none;font-size:15px;color:#fd6;margin-top:10px}
+</style>
+</head>
+<body>
+  <h1>手机 Telegram → 设置 → 设备 → 关联桌面设备</h1>
+  <div class="hint">扫下面这张码即可让 NAS 上的浏览器登录你的账号。<br>二维码约 30–60 秒一轮，页面每 3 秒自动换新；<b>确保扫的时候码是刚出现的</b>。</div>
+  <img id="qr" src="qr.png" alt="Telegram QR">
+  <div id="st">加载中…</div>
+  <div id="ask">已经登录成功了？跟我说一声就行，这个页面可以关掉了。</div>
+<script>
+async function tick(){
+  try{
+    const r = await fetch('status.json?_=' + Date.now(), {cache:'no-store'});
+    const j = await r.json();
+    document.getElementById('st').textContent = '上次更新：' + j.time + '（状态：' + j.state + '）';
+    if (j.state === 'other') document.getElementById('ask').style.display = 'block';
+  }catch(e){ document.getElementById('st').textContent = '状态读取失败'; }
+  const img = document.getElementById('qr');
+  img.src = 'qr.png?_=' + Date.now();
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

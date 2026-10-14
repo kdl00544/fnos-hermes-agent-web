@@ -851,6 +851,12 @@ function _moduleLevelAutoRegisterMcp() {
       if (!(cat.fields || []).every(function (f) { return !!creds[f.key]; })) return;
       connObj["conn-" + cat.kind] = { command: nodeBin, args: [MCP_BRIDGE_SCRIPT, cat.kind, String(UI_PORT)] };
     });
+    // conn-* 集合没变化就别重建整块：_moduleParseMcpServers 只认两层键，
+    // 重建会把 sampling/elicitation/headers 这类嵌套配置拍平成空值
+    // （2026-10-12 MCP 全部连不上的根因：null 让 reading 侧 AttributeError）。
+    const curConn = new Set((yml.match(/^  conn-[A-Za-z0-9_-]+:/gm) || []).map(l => l.trim().slice(0, -1)));
+    const wantConn = new Set(Object.keys(connObj));
+    if (curConn.size === wantConn.size && [...wantConn].every(k => curConn.has(k))) return;
     // 合并：保留现有非 conn-* 的 MCP 服务器（用户手动配置不被覆盖），conn-* 按凭证补齐
     const merged = _moduleParseMcpServers(yml);
     Object.keys(connObj).forEach(k => { merged[k] = connObj[k]; });

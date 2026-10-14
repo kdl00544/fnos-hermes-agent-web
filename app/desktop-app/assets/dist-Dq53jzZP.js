@@ -1,0 +1,1 @@
+import{Ia as e}from"./shiki-BQVyVbPV.js";export{e as code};

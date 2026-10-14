@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "commit": "71d34bad",
+  "commitDate": null,
+  "branch": "main",
+  "builtAt": "2026-10-12T11:50:21+00:00",
+  "dirty": false,
+  "source": "local",
+  "distribution": null,
+  "updateMechanism": "app-installer",
+  "baseVersion": "0.21.7",
+  "displayVersion": "0.21.7",
+  "distance": 0,
+  "payload": "bootstrap",
+  "tag": "v0.21.7"
+}
