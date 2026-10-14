@@ -1,16 +1,16 @@
 {
   "schemaVersion": 2,
-  "commit": "71d34bad",
+  "commit": "e06df9c2eae6901f4c88f464e0ae6e753c0428b8",
   "commitDate": null,
   "branch": "main",
-  "builtAt": "2026-10-12T11:50:21+00:00",
+  "builtAt": "2026-10-14T07:16:44+00:00",
   "dirty": false,
   "source": "local",
   "distribution": null,
   "updateMechanism": "app-installer",
-  "baseVersion": "0.21.7",
-  "displayVersion": "0.21.7",
+  "baseVersion": "0.22.0",
+  "displayVersion": "0.22.0",
   "distance": 0,
   "payload": "bootstrap",
-  "tag": "v0.21.7"
+  "tag": "v0.22.0"
 }
